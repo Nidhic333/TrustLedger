@@ -1,0 +1,25 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { app } from '../backend/src/app.js';
+import { all,one,run } from '../backend/src/db.js';
+import { seed,issue,find,status } from '../backend/src/service.js';
+import { publicClient } from '../backend/src/chain.js';
+test('Integrated REST workflow with SQLite and confirmed blockchain receipts',async()=>{process.env.DEMO_MODE='true';await seed();const server=app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));const base='http://127.0.0.1:'+server.address().port+'/api';const api=async(path,body,role='bankA')=>{const r=await fetch(base+path,{method:body?'POST':'GET',headers:{'content-type':'application/json','x-demo-role':role},body:body?JSON.stringify(body):undefined});return {http:r.status,...await r.json()};};try {
+ assert.equal((await api('/customers',{})).http,400);
+ for(const a of all("SELECT * FROM kyc_applications WHERE review_status IN ('PENDING','REJECTED')"))await assert.rejects(issue(a.id));
+ const reg=await api('/customers',{full_name:'Faculty Demo',customer_reference:'TEST-'+Date.now(),country:'India',demo_document_type:'Demo Identity Document',demo_document_reference:'DEMO-TEST'});assert.equal(reg.http,200);const id=reg.data.id,application_id=reg.data.application_id;
+ await api('/kyc/applications/'+application_id+'/review',{status:'APPROVED'});
+ const issued=await api('/credentials/issue',{application_id});assert.equal(issued.http,200);const c=issued.data;assert.equal((await publicClient.getTransactionReceipt({hash:c.issuance_tx_hash})).status,'success');
+ const verify=async()=> (await api('/credentials/verify',{reference:c.credential_reference},'bankB')).data.status;
+ assert.equal(await verify(),'NO_CONSENT');
+ const consent=await api('/consents/grant',{reference:c.credential_reference,customer_id:id,hours:24},'customer');assert.equal(await verify(),'VERIFIED');
+ run('UPDATE consents SET expires_at=? WHERE id=?',Date.now()-1000,consent.data.id);assert.equal(await verify(),'CONSENT_EXPIRED');
+ await api('/consents/revoke',{id:consent.data.id,customer_id:id},'customer');assert.equal(await verify(),'NO_CONSENT');
+ await api('/consents/grant',{reference:c.credential_reference,customer_id:id},'customer');
+ await api('/demo/tamper',{reference:c.credential_reference},'admin');assert.equal(await verify(),'INTEGRITY_MISMATCH');await api('/demo/restore',{},'admin');assert.equal(await verify(),'VERIFIED');
+ const before=one('SELECT COUNT(*) n FROM credentials').n;const dup=await api('/demo/duplicate',{reference:c.credential_reference},'admin');assert.equal(dup.http,200);assert.equal(one('SELECT COUNT(*) n FROM credentials').n,before);
+ await api('/credentials/'+c.credential_reference+'/revoke',{});assert.equal(await verify(),'REVOKED');
+ assert.ok((await Promise.all(all('SELECT * FROM credentials').map(status))).includes('KYC_EXPIRED'));
+ assert.equal((await api('/demo/tamper',{reference:c.credential_reference},'bankA')).http,403);
+ process.env.DEMO_MODE='false';assert.equal((await api('/demo/reset',{},'admin')).http,403);
+ }finally{server.close();}});
